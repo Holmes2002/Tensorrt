@@ -8,10 +8,10 @@ if __name__ == '__main__':
     #                             batch_size = 4,
     #                             engine = 'TRT')
     # ONNX
-    detector = Yolov4BatchTRT(model_path='weights/yolov4_-1_3_608_608_dynamic.onnx',
+    detector = Yolov4BatchTRT(model_path='weights/yolov4-416.trt',
                                 input_shape = (608, 608),
                                 batch_size = 4,
-                                engine = 'ONNX')
+                                engine = 'TRT')
 
     # TRITON
     # detector = Yolov4BatchTRT(input_shape = (608, 608),
