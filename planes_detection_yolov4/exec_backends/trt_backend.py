@@ -1,10 +1,21 @@
 import pycuda.driver as cuda
 import pycuda.autoinit
 import numpy as np
-
+from utils import _preprocess_yolo,_postprocess_yolo
 import tensorrt as trt
 
 TRT_LOGGER = trt.Logger()
+def get_input_shape(engine):
+    """Get input shape of the TensorRT YOLO engine."""
+    binding = engine[0]
+    assert engine.binding_is_input(binding)
+    binding_dims = engine.get_binding_shape(binding)
+    if len(binding_dims) == 4:
+        return tuple(binding_dims[2:])
+    elif len(binding_dims) == 3:
+        return tuple(binding_dims[1:])
+    else:
+        raise ValueError('bad dims of binding %s: %s' % (binding, str(binding_dims)))
 
 # Simple helper data class that's a little nicer to use than a 2-tuple.
 class HostDeviceMem(object):
@@ -73,56 +84,110 @@ def do_inference(context, bindings, inputs, outputs, stream):
     # Return only the host outputs.
     return [out.host for out in outputs]
 
-class TrtModel(object):
-    def __init__(self, model, max_size, total_classes = 80):
-        self.engine_file = model
-        self.engine = None
-        self.inputs = None
-        self.outputs = None
-        self.bindings = None
-        self.stream = None
-        self.context = None
-        self.input_shapes = None
-        self.out_shapes = None
-        self.max_batch_size = 1
-        self.max_size = max_size
-        self.total_classes = total_classes
+def do_inference(context, bindings, inputs, outputs, stream, batch_size=1):
+    """do_inference (for TensorRT 6.x or lower)
 
-    def build(self):
-        with open(self.engine_file, 'rb') as f, trt.Runtime(TRT_LOGGER) as runtime:
-            self.engine = runtime.deserialize_cuda_engine(f.read())
-        # Allocate
-        self.max_boxes = self.get_number_of_boxes(self.max_size, self.max_size)
-        self.inputs, self.outputs, self.bindings, self.stream, self.input_shapes, self.out_shapes, self.out_names, self.max_batch_size = \
-                allocate_buffers(self.engine, max_boxes = self.max_boxes, total_classes = self.total_classes)
-        self.context = self.engine.create_execution_context()
-        self.context.active_optimization_profile = 0
+    This function is generalized for multiple inputs/outputs.
+    Inputs and outputs are expected to be lists of HostDeviceMem objects.
+    """
+    # Transfer input data to the GPU.
+    [cuda.memcpy_htod_async(inp.device, inp.host, stream) for inp in inputs]
+    # Run inference.
+    context.execute_async(batch_size=batch_size,
+                          bindings=bindings,
+                          stream_handle=stream.handle)
+    # Transfer predictions back from the GPU.
+    [cuda.memcpy_dtoh_async(out.host, out.device, stream) for out in outputs]
+    # Synchronize the stream
+    stream.synchronize()
+    # Return only the host outputs.
+    return [out.host for out in outputs]
 
-    def get_number_of_boxes(self, im_width, im_height):
-        # Calculate total boxes (3 detect layers)
-        assert im_width % 32 == 0 and im_height % 32 == 0
-        return (int(im_width*im_height/32/32) + int(im_width*im_height/16/16) + int(im_width*im_height/8/8))*3
-        
-    def run(self, input, deflatten: bool = True, as_dict = False):
-        # lazy load implementation
-        if self.engine is None:
-            self.build()
 
-        input = np.asarray(input)
-        batch_size, _, im_height, im_width = input.shape
-        assert batch_size <= self.max_batch_size
-        assert max(im_width, im_height) <= self.max_size, "Invalid shape: {}x{}, max shape: {}".format(im_width, im_height, self.max_size)
-        allocate_place = np.prod(input.shape)
-        # print('allocate_place', input.shape)
-        self.inputs[0].host[:allocate_place] = input.flatten(order='C').astype(np.float32)
-        self.context.set_binding_shape(0, input.shape)
-        trt_outputs = do_inference(
-            self.context, bindings=self.bindings,
-            inputs=self.inputs, outputs=self.outputs, stream=self.stream)
-        if deflatten:
-            out_shapes = [(batch_size, ) + (self.get_number_of_boxes(im_width, im_height), 1, 4), (batch_size, ) + (self.get_number_of_boxes(im_width, im_height), 80)]
-            trt_outputs = [output[:np.prod(shape)].reshape(shape) for output, shape in zip(trt_outputs, out_shapes)]
-        if as_dict:
-            return {self.out_names[ix]: trt_output[:batch_size] for ix, trt_output in enumerate(trt_outputs)}
-        return [trt_output[:batch_size] for trt_output in trt_outputs]
+def do_inference_v2(context, bindings, inputs, outputs, stream):
+    """do_inference_v2 (for TensorRT 7.0+)
 
+    This function is generalized for multiple inputs/outputs for full
+    dimension networks.
+    Inputs and outputs are expected to be lists of HostDeviceMem objects.
+    """
+    # Transfer input data to the GPU.
+    [cuda.memcpy_htod_async(inp.device, inp.host, stream) for inp in inputs]
+    # Run inference.
+    context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
+    # Transfer predictions back from the GPU.
+    [cuda.memcpy_dtoh_async(out.host, out.device, stream) for out in outputs]
+    # Synchronize the stream
+    stream.synchronize()
+    # Return only the host outputs.
+    return [out.host for out in outputs]
+
+
+class TrtYOLO(object):
+    """TrtYOLO class encapsulates things needed to run TRT YOLO."""
+
+    def _load_engine(self):
+        TRTbin = 'yolo/%s.trt' % self.model
+        with open(TRTbin, 'rb') as f, trt.Runtime(self.trt_logger) as runtime:
+            return runtime.deserialize_cuda_engine(f.read())
+
+    def __init__(self, model, category_num=80, letter_box=False, cuda_ctx=None):
+        """Initialize TensorRT plugins, engine and conetxt."""
+        self.model = model
+        self.category_num = category_num
+        self.letter_box = letter_box
+        self.cuda_ctx = cuda_ctx
+        if self.cuda_ctx:
+            self.cuda_ctx.push()
+
+        self.inference_fn = do_inference if trt.__version__[0] < '7' \
+                                         else do_inference_v2
+        self.trt_logger = trt.Logger(trt.Logger.INFO)
+        self.engine = self._load_engine()
+
+        self.input_shape = get_input_shape(self.engine)
+
+        try:
+            self.context = self.engine.create_execution_context()
+            self.inputs, self.outputs, self.bindings, self.stream = \
+                allocate_buffers(self.engine)
+        except Exception as e:
+            raise RuntimeError('fail to allocate CUDA resources') from e
+        finally:
+            if self.cuda_ctx:
+                self.cuda_ctx.pop()
+
+    def __del__(self):
+        """Free CUDA memories."""
+        del self.outputs
+        del self.inputs
+        del self.stream
+
+    def detect(self, img, conf_th=0.3, letter_box=None):
+        """Detect objects in the input image."""
+        letter_box = self.letter_box if letter_box is None else letter_box
+        img_resized = _preprocess_yolo(img, self.input_shape, letter_box)
+
+        # Set host input to the image. The do_inference() function
+        # will copy the input to the GPU before executing.
+        self.inputs[0].host = np.ascontiguousarray(img_resized)
+        if self.cuda_ctx:
+            self.cuda_ctx.push()
+        trt_outputs = self.inference_fn(
+            context=self.context,
+            bindings=self.bindings,
+            inputs=self.inputs,
+            outputs=self.outputs,
+            stream=self.stream)
+        if self.cuda_ctx:
+            self.cuda_ctx.pop()
+
+        boxes, scores, classes = _postprocess_yolo(
+            trt_outputs, img.shape[1], img.shape[0], conf_th,
+            nms_threshold=0.5, input_shape=self.input_shape,
+            letter_box=letter_box)
+
+        # clip x1, y1, x2, y2 within original image
+        boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, img.shape[1]-1)
+        boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, img.shape[0]-1)
+        return boxes, scores, classes
